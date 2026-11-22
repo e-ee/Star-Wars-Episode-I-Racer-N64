@@ -1,0 +1,10 @@
+Khronos OpenXR SDK Headers & Prebuilt Android Loader
+
+1. OpenXR Headers (thirdparty/openxr/include/openxr/):
+   Copyright 2017-2025 The Khronos Group Inc.
+   SPDX-License-Identifier: Apache-2.0 OR MIT
+
+2. Meta Quest OpenXR Mobile Loader (thirdparty/openxr/libs/arm64-v8a/libopenxr_loader.so):
+   Distributed via the OpenXR Mobile SDK / Meta Quest OpenXR Loader under
+   the Apache License 2.0 / Khronos OpenXR Loader terms (vendored from
+   MrSco/goldeneye-vr, MIT).

@@ -1,0 +1,117 @@
+import org.gradle.internal.os.OperatingSystem
+
+plugins {
+    id 'com.android.application'
+}
+
+def hostOs = OperatingSystem.current()
+def isWin = hostOs.isWindows()
+def isMac = hostOs.isMacOsX()
+def hostTag = isWin ? 'win' : (isMac ? 'mac' : 'linux')
+def hostShaderToolsDir = layout.buildDirectory.dir("host-tools-${hostTag}").get().asFile
+def hostFileToC = new File(hostShaderToolsDir, isWin ? 'file_to_c.exe' : 'file_to_c')
+def hostLibZ = new File(hostShaderToolsDir, 'libz.dylib')
+
+android {
+    namespace 'com.swe1r.quest3'
+    compileSdk 34
+
+    defaultConfig {
+        applicationId 'com.swe1r.quest3'
+        minSdk 29
+        targetSdk 32
+        versionCode 1
+        versionName '0.1.0-q3'
+
+        ndk {
+            abiFilters 'arm64-v8a'
+        }
+
+        externalNativeBuild {
+            cmake {
+                arguments '-DCMAKE_BUILD_TYPE=RelWithDebInfo',
+                          '-DANDROID_PLATFORM=android-29',
+                          '-DANDROID_STL=c++_shared',
+                          '-DZSTD_BUILD_PROGRAMS=OFF',
+                          '-DZSTD_BUILD_TESTS=OFF',
+                          '-DZSTD_BUILD_DICTBUILDER=OFF',
+                          "-DRT64_FILE_TO_C_EXECUTABLE=${hostFileToC.absolutePath.replace('\\', '/')}",
+                          "-DRT64_HOST_DXC_EXTRA_LIB_DIR=${hostShaderToolsDir.absolutePath.replace('\\', '/')}"
+                cppFlags '-std=c++20 -fno-strict-aliasing -DNDEBUG'
+                cFlags '-DNDEBUG'
+            }
+        }
+    }
+
+    ndkVersion '28.2.13676358'
+
+    externalNativeBuild {
+        cmake {
+            path file('../../CMakeLists.txt')
+            version '3.22.1'
+        }
+    }
+
+    sourceSets {
+        main.java.srcDirs += file('../../lib/SDL2/android-project/app/src/main/java')
+        main.jniLibs.srcDirs += file('../../thirdparty/openxr/libs')
+    }
+
+    packaging {
+        jniLibs.useLegacyPackaging = true
+    }
+}
+
+def sdkCmakeDir = new File(android.sdkDirectory, 'cmake/3.22.1/bin')
+def sdkCmake = new File(sdkCmakeDir, isWin ? 'cmake.exe' : 'cmake')
+def sdkNinja = new File(sdkCmakeDir, isWin ? 'ninja.exe' : 'ninja')
+def hostLlvm = System.getenv('RECOMP_HOST_LLVM')
+def hostCc = hostLlvm ? new File(hostLlvm, isWin ? 'clang.exe' : 'clang').absolutePath.replace('\\', '/') : 'clang'
+def hostCxx = hostLlvm ? new File(hostLlvm, isWin ? 'clang++.exe' : 'clang++').absolutePath.replace('\\', '/') : 'clang++'
+
+tasks.register('buildHostShaderTools') {
+    group = 'build setup'
+    description = 'Build RT64 host shader embedding helper (file_to_c and macOS dxc zlib shim).'
+    outputs.file(hostFileToC)
+    if (isMac) {
+        outputs.file(hostLibZ)
+    }
+    doLast {
+        hostShaderToolsDir.mkdirs()
+        if (!hostFileToC.isFile()) {
+            exec {
+                commandLine sdkCmake.absolutePath,
+                        '-S', file('../../lib/rt64/src/tools/file_to_c').absolutePath,
+                        '-B', hostShaderToolsDir.absolutePath,
+                        '-G', 'Ninja',
+                        '-DCMAKE_MAKE_PROGRAM=' + sdkNinja.absolutePath.replace('\\', '/'),
+                        '-DCMAKE_C_COMPILER=' + hostCc,
+                        '-DCMAKE_CXX_COMPILER=' + hostCxx,
+                        '-DCMAKE_BUILD_TYPE=Release',
+                        '-DCMAKE_RUNTIME_OUTPUT_DIRECTORY=' + hostShaderToolsDir.absolutePath
+            }
+            exec {
+                commandLine sdkCmake.absolutePath,
+                        '--build', hostShaderToolsDir.absolutePath,
+                        '--target', 'file_to_c'
+            }
+        }
+        if (isMac && !hostLibZ.isFile()) {
+            exec {
+                commandLine hostCc,
+                        '-shared', '-x', 'c', '/dev/null',
+                        '-o', hostLibZ.absolutePath,
+                        '-Wl,-reexport-lz',
+                        '-Wl,-compatibility_version,1.0.0',
+                        '-Wl,-current_version,1.3.1'
+            }
+        }
+        if (!hostFileToC.isFile()) {
+            throw new GradleException("Host shader tool was not created at ${hostFileToC}")
+        }
+    }
+}
+
+tasks.matching { it.name.startsWith('configureCMake') }.configureEach {
+    dependsOn tasks.named('buildHostShaderTools')
+}

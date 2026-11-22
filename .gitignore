@@ -1,0 +1,51 @@
+# ROMs - users must supply their own cartridge dump
+baserom.z64
+*.z64
+*.n64
+*.v64
+recomp.local.toml
+
+# Build output & generated recompilation artifacts (derived from ROM - never commit)
+build/
+RecompiledFuncs/
+rsp/
+*.o
+*.elf
+*.exe
+*.so
+*.dylib
+*.a
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# IDE & macOS
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Android build output, APKs, keystores, and local SDK paths
+android/app/build/
+android/app/.cxx/
+android/build/
+android/.gradle/
+android/local.properties
+local.properties
+*.apk
+*.aab
+*.idsig
+*.keystore
+*.jks
+keystore.properties
+platform-tools-latest.zip
+
+# Local notes
+*.local.toml

@@ -1,0 +1,36 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index d2ef5fb..3f5c568 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -13,10 +13,13 @@ option(RT64_STATIC "Build RT64 as a static library" OFF)
+ 
+ option(RT64_SDL_WINDOW_VULKAN "Build RT64 to expect an SDL Window outside of Windows" OFF)
+ 
+-set(RT64_FILE_TO_C_EXECUTABLE "file_to_c")
+-if (CMAKE_SYSTEM_NAME MATCHES "Android" AND CMAKE_HOST_WIN32)
+-    # Cross builds need a host executable to embed generated shader text.
+-    set(RT64_FILE_TO_C_EXECUTABLE "${CMAKE_SOURCE_DIR}/android/app/build/host-tools-win/file_to_c.exe")
++if (NOT DEFINED RT64_FILE_TO_C_EXECUTABLE OR RT64_FILE_TO_C_EXECUTABLE STREQUAL "")
++    if (CMAKE_SYSTEM_NAME MATCHES "Android" AND CMAKE_HOST_WIN32)
++        # Cross builds need a host executable to embed generated shader text.
++        set(RT64_FILE_TO_C_EXECUTABLE "${CMAKE_SOURCE_DIR}/android/app/build/host-tools-win/file_to_c.exe")
++    else()
++        set(RT64_FILE_TO_C_EXECUTABLE "file_to_c")
++    endif()
+ endif()
+ 
+ if (NOT ${RT64_STATIC})
+@@ -65,6 +68,13 @@ elseif (CMAKE_SYSTEM_NAME MATCHES "Android")
+     # Do not select DXC from the target architecture.
+     if (CMAKE_HOST_WIN32)
+         set (DXC "${PROJECT_SOURCE_DIR}/src/contrib/dxc/bin/x64/dxc.exe")
++    elseif (CMAKE_HOST_APPLE)
++        set(RT64_HOST_DXC_EXTRA_LIB_DIR "" CACHE PATH "Extra library path for macOS dxc host tool")
++        if (CMAKE_HOST_SYSTEM_PROCESSOR MATCHES "x86_64|amd64|AMD64")
++            set (DXC "DYLD_LIBRARY_PATH=${PROJECT_SOURCE_DIR}/src/contrib/dxc/lib/x64:${RT64_HOST_DXC_EXTRA_LIB_DIR}" "${PROJECT_SOURCE_DIR}/src/contrib/dxc/bin/x64/dxc-macos")
++        else()
++            set (DXC "DYLD_LIBRARY_PATH=${PROJECT_SOURCE_DIR}/src/contrib/dxc/lib/arm64:${RT64_HOST_DXC_EXTRA_LIB_DIR}" "${PROJECT_SOURCE_DIR}/src/contrib/dxc/bin/arm64/dxc-macos")
++        endif()
+     elseif (CMAKE_HOST_SYSTEM_PROCESSOR MATCHES "x86_64|amd64|AMD64")
+         set (DXC "LD_LIBRARY_PATH=${PROJECT_SOURCE_DIR}/src/contrib/dxc/lib/x64" "${PROJECT_SOURCE_DIR}/src/contrib/dxc/bin/x64/dxc-linux")
+     else()
