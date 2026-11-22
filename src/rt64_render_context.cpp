@@ -4,6 +4,8 @@
 // NOMINMAX must be set globally via CMake (target_compile_definitions)
 // Include RT64 first to avoid Windows.h macro conflicts
 #include "hle/rt64_application.h"
+#include "hle/rt64_vr_bridge.h"
+#include "vr/vr_openxr.hpp"
 
 #include <SDL.h>
 #include <cstdio>
@@ -138,6 +140,12 @@ public:
         app_config.detectDataPath = true;
         app_config.useConfigurationFile = true;
 
+#if defined(__ANDROID__)
+        if (!SWE1RVR::initializeAndroid()) {
+            fprintf(stderr, "[SWE1R-VR] OpenXR initialization failed\n");
+        }
+#endif
+
         // Create the RT64 Application
         printf("[SWE1R] Creating RT64 application...\n");
         app_ = std::make_unique<RT64::Application>(core, app_config);
@@ -165,6 +173,16 @@ public:
                 printf("[SWE1R] RT64 %s\n", uber ? "ubershaders only (debug.swe1r.uber=1)" : "specialized shaders on");
             }
 #endif
+            if (SWE1RVR::isActive()) {
+                const SWE1RVR::VRConfig& vrCfg = SWE1RVR::getConfig();
+                RT64::UserConfiguration& cfg = app_->userConfig;
+                cfg.aspectRatio = RT64::UserConfiguration::AspectRatio::Original;
+                cfg.resolution = RT64::UserConfiguration::Resolution::Manual;
+                cfg.resolutionMultiplier = double(vrCfg.rt64ResolutionMultiplier);
+                cfg.antialiasing = RT64::UserConfiguration::Antialiasing::None;
+                cfg.refreshRate = RT64::UserConfiguration::RefreshRate::Original;
+                app_->updateUserConfig(true);
+            }
             is_valid_ = true;
             break;
         case RT64::Application::SetupResult::DynamicLibrariesNotFound:
@@ -187,10 +205,7 @@ public:
     }
 
     ~SWE1RRenderContext() override {
-        if (app_) {
-            printf("[SWE1R] Destroying RT64 application\n");
-            app_.reset();
-        }
+        shutdown();
     }
 
     bool valid() override { return is_valid_; }
@@ -335,13 +350,23 @@ public:
     void shutdown() override {
         printf("[SWE1R] Render context shutdown\n");
         if (app_) {
+            RT64::SetVRBridge(nullptr);
+            app_->presentQueue.reset();
+            app_->workloadQueue.reset();
+            SWE1RVR::shutdown();
             app_.reset();
+        }
+        else {
+            SWE1RVR::shutdown();
         }
         is_valid_ = false;
     }
 
     uint32_t get_display_framerate() const override {
-        return 60; // TODO: query from RT64/display
+        if (SWE1RVR::isActive()) {
+            return uint32_t(SWE1RVR::getConfig().targetRefreshRate);
+        }
+        return 60;
     }
 
     float get_resolution_scale() const override {

@@ -56,13 +56,33 @@ public final class SWE1RacerActivity extends SDLActivity {
 
     @Override
     protected String[] getLibraries() {
-        return new String[] { "SDL2", "main" };
+        return new String[] { "openxr_loader", "SDL2", "main" };
+    }
+
+    private boolean ensureRomInstalled() {
+        final File dest = new File(getFilesDir(), ROM_RELATIVE_PATH);
+        if (dest.isFile()) {
+            return true;
+        }
+        final File extDir = getExternalFilesDir(null);
+        final File[] candidates = new File[] {
+                extDir != null ? new File(extDir, "baserom.z64") : null,
+                extDir != null ? new File(extDir, ROM_RELATIVE_PATH) : null,
+                new File("/sdcard/SWE1R/baserom.z64"),
+                new File("/sdcard/Download/Star Wars Episode I - Racer (USA).z64"),
+                new File("/sdcard/Download/baserom.z64")
+        };
+        for (File candidate : candidates) {
+            if (LauncherActivity.tryImportLocalRom(candidate, dest)) {
+                return true;
+            }
+        }
+        return false;
     }
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
-        // No ROM yet (started some other way than Play): go to the start screen instead of a game that waits.
-        if (!new File(getFilesDir(), ROM_RELATIVE_PATH).isFile()) {
+        if (!ensureRomInstalled()) {
             super.onCreate(savedInstanceState);
             startActivity(new Intent(this, LauncherActivity.class));
             finish();
@@ -70,22 +90,6 @@ public final class SWE1RacerActivity extends SDLActivity {
         }
         super.onCreate(savedInstanceState);
         prefs = getSharedPreferences(RacerMenu.PREFS, MODE_PRIVATE);
-        if (mLayout != null) {
-            pad = new TouchPadView(this);
-            mLayout.addView(pad, new ViewGroup.LayoutParams(
-                    ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
-            menu = new RacerMenu(this, pad, prefs);
-            pad.setOnMenu(menu::open);
-            pad.loadLayout(prefs);
-            pad.setPadVisible(prefs.getBoolean(RacerMenu.PAD, true));
-            pad.setBoostEnabled(prefs.getBoolean(RacerMenu.BOOST, true));
-            pad.setOpacity(RacerMenu.OPACITIES[clamp(prefs.getInt(RacerMenu.OPACITY, RacerMenu.DEF_OPACITY),
-                    RacerMenu.OPACITIES.length)] / 100f);
-            pad.setSizeScale(RacerMenu.SIZES[clamp(prefs.getInt(RacerMenu.SIZE, RacerMenu.DEF_SIZE),
-                    RacerMenu.SIZES.length)]);
-            setFpsShown(prefs.getBoolean(RacerMenu.FPS, false));
-        }
-        applyVideo();
     }
 
     private static int clamp(int v, int count) { return Math.max(0, Math.min(count - 1, v)); }

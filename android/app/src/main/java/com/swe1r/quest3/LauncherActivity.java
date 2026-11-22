@@ -36,7 +36,7 @@ import java.util.Locale;
 public final class LauncherActivity extends Activity {
     private static final int PICK_ROM = 1;
     // The dump the game was recompiled for (SHA-1 of the .z64): Star Wars Episode I: Racer (USA).
-    private static final String KNOWN_SHA1 = "3542d5597c8a56ea8f5c63bceae97a24c4c08d58";
+    static final String KNOWN_SHA1 = "3542d5597c8a56ea8f5c63bceae97a24c4c08d58";
 
     private TextView status;
     private Button play;
@@ -175,10 +175,27 @@ public final class LauncherActivity extends Activity {
     }
 
     private String importRom(Uri uri) throws IOException {
-        final File dest = rom(), tmp = new File(dest.getPath() + ".tmp");
+        try (InputStream in = getContentResolver().openInputStream(uri)) {
+            if (in == null) throw new IOException("cannot open the file");
+            return importRomStream(in, rom());
+        }
+    }
+
+    static boolean tryImportLocalRom(File source, File dest) {
+        if (source == null || !source.isFile() || !source.canRead()) return false;
+        try (InputStream in = new java.io.FileInputStream(source)) {
+            final String res = importRomStream(in, dest);
+            return "Game ROM ready. Press Play.".equals(res);
+        } catch (IOException e) {
+            return false;
+        }
+    }
+
+    static String importRomStream(InputStream in, File dest) throws IOException {
+        final File tmp = new File(dest.getPath() + ".tmp");
         //noinspection ResultOfMethodCallIgnored
         dest.getParentFile().mkdirs();
-        final String sha1 = copyAsZ64(uri, tmp);
+        final String sha1 = copyAsZ64(in, tmp);
         if (sha1 == null) {
             //noinspection ResultOfMethodCallIgnored
             tmp.delete();
@@ -198,9 +215,8 @@ public final class LauncherActivity extends Activity {
      * Copies a picked N64 ROM to `to` in .z64 (big-endian) byte order and returns the SHA-1 of the result (lowercase
      * hex), or null when the file does not start like an N64 ROM. .v64 swaps every 2 bytes, .n64 reverses every 4.
      */
-    private String copyAsZ64(Uri uri, File to) throws IOException {
-        try (InputStream in = getContentResolver().openInputStream(uri); OutputStream out = new FileOutputStream(to)) {
-            if (in == null) throw new IOException("cannot open the file");
+    private static String copyAsZ64(InputStream in, File to) throws IOException {
+        try (OutputStream out = new FileOutputStream(to)) {
             final MessageDigest sha = MessageDigest.getInstance("SHA-1");
             final byte[] buf = new byte[1 << 16];
             int order = -1; // 0 = z64, 1 = v64, 2 = n64

@@ -77,6 +77,8 @@ set(SWE1RACER_HOST_SOURCES
     src/section_table.cpp
     src/rt64_render_context.cpp
     src/audio.cpp
+    src/vr/vr_openxr.cpp
+    src/vr/vr_input.cpp
     rsp/aspMain.cpp     # RSPRecomp output from aspMain.toml (made from your ROM, not committed)
 )
 
@@ -103,7 +105,14 @@ target_include_directories(SWE1Racer PRIVATE
     ${RT64_DIR}/src/contrib/mupen64plus-core/src/api  # mupen64plus API types
     ${CMAKE_SOURCE_DIR}/RecompiledFuncs              # funcs.h
     ${CMAKE_SOURCE_DIR}/include
+    ${CMAKE_SOURCE_DIR}/src
 )
+
+if(ANDROID)
+    target_include_directories(SWE1Racer PRIVATE
+        ${CMAKE_SOURCE_DIR}/thirdparty/openxr/include
+    )
+endif()
 
 # RT64 requires these defines for its headers (normally set at directory scope)
 target_compile_definitions(SWE1Racer PRIVATE NOMINMAX HLSL_CPU FFX_GCC)
@@ -121,5 +130,10 @@ if(WIN32)
     target_link_libraries(SWE1Racer PRIVATE dxgi d3d12 d3dcompiler dbghelp)
     target_link_options(SWE1Racer PRIVATE /MAP)
 elseif(ANDROID)
-    target_link_libraries(SWE1Racer PRIVATE android log vulkan)
+    target_link_libraries(SWE1Racer PRIVATE
+        android
+        log
+        vulkan
+        ${CMAKE_SOURCE_DIR}/thirdparty/openxr/libs/arm64-v8a/libopenxr_loader.so
+    )
 endif()

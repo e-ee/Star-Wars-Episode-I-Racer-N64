@@ -1,0 +1,441 @@
+diff --git a/plume_vulkan.cpp b/plume_vulkan.cpp
+index e547f12..f7585a6 100644
+--- a/plume_vulkan.cpp
++++ b/plume_vulkan.cpp
+@@ -35,6 +35,8 @@
+ namespace plume {
+     static std::atomic<VulkanLoaderInitializeCallback> g_vulkanLoaderInitializeCallback{nullptr};
+     static std::atomic<VulkanPhysicalDeviceObserver> g_vulkanPhysicalDeviceObserver{nullptr};
++    static std::mutex g_vulkanExternalHooksMutex;
++    static VulkanExternalHooks g_vulkanExternalHooks{};
+ 
+     void SetVulkanLoaderInitializeCallback(VulkanLoaderInitializeCallback callback) {
+         g_vulkanLoaderInitializeCallback.store(callback, std::memory_order_release);
+@@ -44,6 +46,94 @@ namespace plume {
+         g_vulkanPhysicalDeviceObserver.store(observer, std::memory_order_release);
+     }
+ 
++    void SetVulkanExternalHooks(const VulkanExternalHooks &hooks) {
++        std::scoped_lock<std::mutex> lock(g_vulkanExternalHooksMutex);
++        g_vulkanExternalHooks = hooks;
++    }
++
++    VulkanExternalHooks GetVulkanExternalHooks() {
++        std::scoped_lock<std::mutex> lock(g_vulkanExternalHooksMutex);
++        return g_vulkanExternalHooks;
++    }
++
++    std::mutex *VulkanGetQueueMutex(RenderDevice *device, uint32_t familyIndex, uint32_t queueIndex) {
++        auto *vkDevice = static_cast<VulkanDevice *>(device);
++        if (vkDevice == nullptr || familyIndex >= vkDevice->queueFamilies.size()) {
++            return nullptr;
++        }
++        auto &queues = vkDevice->queueFamilies[familyIndex].queues;
++        if (queueIndex >= queues.size()) {
++            return nullptr;
++        }
++        return queues[queueIndex].mutex.get();
++    }
++
++    bool VulkanBlitTextureToExternalImage(RenderCommandList *commandList, RenderTexture *srcTexture, uint32_t srcWidth, uint32_t srcHeight, VkImage dstImage, uint32_t dstWidth, uint32_t dstHeight, VkImageLayout dstFinalLayout, bool flipY) {
++        if (commandList == nullptr || srcTexture == nullptr || dstImage == VK_NULL_HANDLE || srcWidth == 0 || srcHeight == 0 || dstWidth == 0 || dstHeight == 0) {
++            return false;
++        }
++
++        auto *vkCmdList = static_cast<VulkanCommandList *>(commandList);
++        auto *vkSrcTex = static_cast<VulkanTexture *>(srcTexture);
++        if (vkSrcTex->vk == VK_NULL_HANDLE) {
++            return false;
++        }
++
++        const uint32_t clampedSrcW = std::min(srcWidth, vkSrcTex->desc.width);
++        const uint32_t clampedSrcH = std::min(srcHeight, vkSrcTex->desc.height);
++        if (clampedSrcW == 0 || clampedSrcH == 0) {
++            return false;
++        }
++
++        vkCmdList->endActiveRenderPass();
++
++        commandList->barriers(RenderBarrierStage::COPY, RenderTextureBarrier(srcTexture, RenderTextureLayout::COPY_SOURCE));
++
++        VkImageMemoryBarrier preBarrier = {};
++        preBarrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
++        preBarrier.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
++        preBarrier.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
++        preBarrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
++        preBarrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
++        preBarrier.image = dstImage;
++        preBarrier.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
++        preBarrier.srcAccessMask = 0;
++        preBarrier.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
++        vkCmdPipelineBarrier(vkCmdList->vk, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &preBarrier);
++
++        VkImageBlit blit = {};
++        blit.srcSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
++        blit.srcOffsets[0] = { 0, 0, 0 };
++        blit.srcOffsets[1] = { int32_t(clampedSrcW), int32_t(clampedSrcH), 1 };
++        blit.dstSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
++        if (flipY) {
++            blit.dstOffsets[0] = { 0, int32_t(dstHeight), 0 };
++            blit.dstOffsets[1] = { int32_t(dstWidth), 0, 1 };
++        }
++        else {
++            blit.dstOffsets[0] = { 0, 0, 0 };
++            blit.dstOffsets[1] = { int32_t(dstWidth), int32_t(dstHeight), 1 };
++        }
++        vkCmdBlitImage(vkCmdList->vk, vkSrcTex->vk, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, dstImage, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blit, VK_FILTER_LINEAR);
++
++        VkImageMemoryBarrier postBarrier = {};
++        postBarrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
++        postBarrier.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
++        postBarrier.newLayout = dstFinalLayout;
++        postBarrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
++        postBarrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
++        postBarrier.image = dstImage;
++        postBarrier.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
++        postBarrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
++        VkPipelineStageFlags dstStage = VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT;
++        if (dstFinalLayout == VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL) {
++            dstStage = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
++            postBarrier.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
++        }
++        vkCmdPipelineBarrier(vkCmdList->vk, VK_PIPELINE_STAGE_TRANSFER_BIT, dstStage, 0, 0, nullptr, 0, nullptr, 1, &postBarrier);
++        return true;
++    }
++
+ #if defined(__ANDROID__)
+     static std::atomic<bool> g_androidSurfaceReady{true};
+ #endif
+@@ -2105,6 +2195,15 @@ namespace plume {
+         this->commandQueue = commandQueue;
+         this->desc = desc;
+ 
++        const VulkanExternalHooks hooks = GetVulkanExternalHooks();
++        if (hooks.headlessSwapChain) {
++            headless = true;
++            width = hooks.headlessWidth;
++            height = hooks.headlessHeight;
++            commandQueue->swapChains.insert(this);
++            return;
++        }
++
+         VkResult res;
+ 
+ #   ifdef _WIN64
+@@ -2290,6 +2389,10 @@ namespace plume {
+     }
+ 
+     bool VulkanSwapChain::present(uint32_t textureIndex, RenderCommandSemaphore **waitSemaphores, uint32_t waitSemaphoreCount) {
++        if (headless) {
++            return true;
++        }
++
+         thread_local std::vector<VkSemaphore> waitSemaphoresVector;
+         waitSemaphoresVector.clear();
+         for (uint32_t i = 0; i < waitSemaphoreCount; i++) {
+@@ -2337,6 +2440,10 @@ namespace plume {
+     }
+ 
+     void VulkanSwapChain::wait() {
++        if (headless) {
++            return;
++        }
++
+         assert(desc.enablePresentWait && "Present wait should've been explicitly enabled during swap chain creation before using the wait function.");
+ 
+         if (currentPresentId >= desc.maxFrameLatency) {
+@@ -2346,6 +2453,10 @@ namespace plume {
+     }
+ 
+     bool VulkanSwapChain::resize() {
++        if (headless) {
++            return true;
++        }
++
+ #if defined(__ANDROID__)
+         if (!g_androidSurfaceReady.load(std::memory_order_acquire)) {
+             return false;
+@@ -2499,6 +2610,10 @@ namespace plume {
+     }
+ 
+     bool VulkanSwapChain::needsResize() const {
++        if (headless) {
++            return false;
++        }
++
+ #if defined(__ANDROID__)
+         if (!g_androidSurfaceReady.load(std::memory_order_acquire)) {
+             return true;
+@@ -2546,6 +2661,10 @@ namespace plume {
+     }
+ 
+     bool VulkanSwapChain::isEmpty() const {
++        if (headless) {
++            return false;
++        }
++
+ #if defined(__ANDROID__)
+         if (!g_androidSurfaceReady.load(std::memory_order_acquire)) {
+             return true;
+@@ -2555,6 +2674,10 @@ namespace plume {
+     }
+ 
+     uint32_t VulkanSwapChain::getRefreshRate() const {
++        if (headless) {
++            return GetVulkanExternalHooks().headlessRefreshRate;
++        }
++
+         VkRefreshCycleDurationGOOGLE refreshCycle = {};
+         VkResult res = vkGetRefreshCycleDurationGOOGLE(commandQueue->device->vk, vk, &refreshCycle);
+         if (res != VK_SUCCESS) {
+@@ -2591,6 +2714,13 @@ namespace plume {
+     }
+ 
+     bool VulkanSwapChain::acquireTexture(RenderCommandSemaphore *signalSemaphore, uint32_t *textureIndex) {
++        if (headless) {
++            if (textureIndex != nullptr) {
++                *textureIndex = 0;
++            }
++            return false;
++        }
++
+         assert(signalSemaphore != nullptr);
+ 
+         VulkanCommandSemaphore *interfaceSemaphore = static_cast<VulkanCommandSemaphore *>(signalSemaphore);
+@@ -2603,6 +2733,10 @@ namespace plume {
+     }
+ 
+     void VulkanSwapChain::releaseSwapChain() {
++        if (headless) {
++            return;
++        }
++
+         if (vk != VK_NULL_HANDLE) {
+             vkDestroySwapchainKHR(commandQueue->device->vk, vk, nullptr);
+             vk = VK_NULL_HANDLE;
+@@ -3847,49 +3981,66 @@ namespace plume {
+ 
+         this->renderInterface = renderInterface;
+ 
+-        uint32_t deviceCount = 0;
+-        vkEnumeratePhysicalDevices(renderInterface->instance, &deviceCount, nullptr);
+-        if (deviceCount == 0) {
+-            fprintf(stderr, "Unable to find devices that support Vulkan.\n");
+-            return;
++        const VulkanExternalHooks hooks = GetVulkanExternalHooks();
++        if (hooks.pickPhysicalDevice != nullptr) {
++            VkPhysicalDevice pickedDevice = VK_NULL_HANDLE;
++            VkResult pickRes = hooks.pickPhysicalDevice(renderInterface->instance, &pickedDevice);
++            if (pickRes == VK_SUCCESS && pickedDevice != VK_NULL_HANDLE) {
++                VkPhysicalDeviceProperties deviceProperties;
++                vkGetPhysicalDeviceProperties(pickedDevice, &deviceProperties);
++                physicalDevice = pickedDevice;
++                description.name = deviceProperties.deviceName;
++                description.type = toDeviceType(deviceProperties.deviceType);
++                description.driverVersion = deviceProperties.driverVersion;
++                description.vendor = RenderDeviceVendor(deviceProperties.vendorID);
++            }
+         }
+-        
+-        std::vector<VkPhysicalDevice> physicalDevices(deviceCount);
+-        vkEnumeratePhysicalDevices(renderInterface->instance, &deviceCount, physicalDevices.data());
+-
+-        uint32_t currentDeviceTypeScore = 0;
+-        uint32_t deviceTypeScoreTable[] = {
+-            0,  // VK_PHYSICAL_DEVICE_TYPE_OTHER
+-            3,  // VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU
+-            4,  // VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU
+-            2,  // VK_PHYSICAL_DEVICE_TYPE_VIRTUAL_GPU
+-            1   // VK_PHYSICAL_DEVICE_TYPE_CPU
+-        };
+ 
+-        for (uint32_t i = 0; i < deviceCount; i++) {
+-            VkPhysicalDeviceProperties deviceProperties;
+-            vkGetPhysicalDeviceProperties(physicalDevices[i], &deviceProperties);
+-
+-            uint32_t deviceTypeIndex = deviceProperties.deviceType;
+-            if (deviceTypeIndex > 4) {
+-                continue;
++        if (physicalDevice == VK_NULL_HANDLE) {
++            uint32_t deviceCount = 0;
++            vkEnumeratePhysicalDevices(renderInterface->instance, &deviceCount, nullptr);
++            if (deviceCount == 0) {
++                fprintf(stderr, "Unable to find devices that support Vulkan.\n");
++                return;
+             }
++            
++            std::vector<VkPhysicalDevice> physicalDevices(deviceCount);
++            vkEnumeratePhysicalDevices(renderInterface->instance, &deviceCount, physicalDevices.data());
++
++            uint32_t currentDeviceTypeScore = 0;
++            uint32_t deviceTypeScoreTable[] = {
++                0,  // VK_PHYSICAL_DEVICE_TYPE_OTHER
++                3,  // VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU
++                4,  // VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU
++                2,  // VK_PHYSICAL_DEVICE_TYPE_VIRTUAL_GPU
++                1   // VK_PHYSICAL_DEVICE_TYPE_CPU
++            };
+ 
+-            std::string deviceName(deviceProperties.deviceName);
+-            uint32_t deviceTypeScore = deviceTypeScoreTable[deviceTypeIndex];
+-            bool preferDeviceTypeScore = (deviceTypeScore > currentDeviceTypeScore);
+-            bool preferUserChoice = preferredDeviceName == deviceName;
+-            bool preferOption = preferDeviceTypeScore || preferUserChoice;
+-            if (preferOption) {
+-                physicalDevice = physicalDevices[i];
+-                description.name = deviceName;
+-                description.type = toDeviceType(deviceProperties.deviceType);
+-                description.driverVersion = deviceProperties.driverVersion;
+-                description.vendor = RenderDeviceVendor(deviceProperties.vendorID);
+-                currentDeviceTypeScore = deviceTypeScore;
++            for (uint32_t i = 0; i < deviceCount; i++) {
++                VkPhysicalDeviceProperties deviceProperties;
++                vkGetPhysicalDeviceProperties(physicalDevices[i], &deviceProperties);
+ 
+-                if (preferUserChoice) {
+-                    break;
++                uint32_t deviceTypeIndex = deviceProperties.deviceType;
++                if (deviceTypeIndex > 4) {
++                    continue;
++                }
++
++                std::string deviceName(deviceProperties.deviceName);
++                uint32_t deviceTypeScore = deviceTypeScoreTable[deviceTypeIndex];
++                bool preferDeviceTypeScore = (deviceTypeScore > currentDeviceTypeScore);
++                bool preferUserChoice = preferredDeviceName == deviceName;
++                bool preferOption = preferDeviceTypeScore || preferUserChoice;
++                if (preferOption) {
++                    physicalDevice = physicalDevices[i];
++                    description.name = deviceName;
++                    description.type = toDeviceType(deviceProperties.deviceType);
++                    description.driverVersion = deviceProperties.driverVersion;
++                    description.vendor = RenderDeviceVendor(deviceProperties.vendorID);
++                    currentDeviceTypeScore = deviceTypeScore;
++
++                    if (preferUserChoice) {
++                        break;
++                    }
+                 }
+             }
+         }
+@@ -3906,7 +4057,10 @@ namespace plume {
+         std::vector<VkExtensionProperties> availableExtensions(extensionCount);
+         vkEnumerateDeviceExtensionProperties(physicalDevice, nullptr, &extensionCount, availableExtensions.data());
+ 
+-        std::unordered_set<std::string> missingRequiredExtensions = RequiredDeviceExtensions;
++        std::unordered_set<std::string> missingRequiredExtensions;
++        if (!hooks.headlessSwapChain) {
++            missingRequiredExtensions = RequiredDeviceExtensions;
++        }
+         std::unordered_set<std::string> supportedOptionalExtensions;
+ #   if DLSS_ENABLED
+         const std::unordered_set<std::string> dlssExtensions = DLSS::getRequiredDeviceExtensionsVulkan(this);
+@@ -4143,8 +4297,10 @@ namespace plume {
+         }
+ 
+         std::vector<const char *> enabledExtensions;
+-        for (const std::string &extension : RequiredDeviceExtensions) {
+-            enabledExtensions.push_back(extension.c_str());
++        if (!hooks.headlessSwapChain) {
++            for (const std::string &extension : RequiredDeviceExtensions) {
++                enabledExtensions.push_back(extension.c_str());
++            }
+         }
+ 
+         for (const std::string &extension : supportedOptionalExtensions) {
+@@ -4160,7 +4316,8 @@ namespace plume {
+         createInfo.enabledExtensionCount = uint32_t(enabledExtensions.size());
+         createInfo.pEnabledFeatures = &deviceFeatures.features;
+ 
+-        VkResult res = vkCreateDevice(physicalDevice, &createInfo, nullptr, &vk);
++        VkResult res = hooks.createDevice ? hooks.createDevice(physicalDevice, &createInfo, vkGetInstanceProcAddr, &vk)
++                                          : vkCreateDevice(physicalDevice, &createInfo, nullptr, &vk);
+         if (res != VK_SUCCESS) {
+             fprintf(stderr, "vkCreateDevice failed with error code 0x%X.\n", res);
+             return;
+@@ -4169,9 +4326,16 @@ namespace plume {
+         for (uint32_t i = 0; i < queueFamilyCount; i++) {
+             for (uint32_t j = 0; j < queueFamilies[i].queues.size(); j++) {
+                 vkGetDeviceQueue(vk, i, j, &queueFamilies[i].queues[j].vk);
++                if (!queueFamilies[i].queues[j].mutex) {
++                    queueFamilies[i].queues[j].mutex = std::make_unique<std::mutex>();
++                }
+             }
+         }
+ 
++        if (hooks.onDeviceCreated != nullptr) {
++            hooks.onDeviceCreated(renderInterface->instance, physicalDevice, vk, queueFamilyIndices[toFamilyIndex(RenderCommandListType::DIRECT)], 0);
++        }
++
+         VmaVulkanFunctions vmaFunctions = {};
+         vmaFunctions.vkGetInstanceProcAddr = vkGetInstanceProcAddr;
+         vmaFunctions.vkGetDeviceProcAddr = vkGetDeviceProcAddr;
+@@ -4606,7 +4770,12 @@ namespace plume {
+         std::vector<VkExtensionProperties> availableExtensions(extensionCount);
+         vkEnumerateInstanceExtensionProperties(nullptr, &extensionCount, availableExtensions.data());
+ 
+-        std::unordered_set<std::string> requiredExtensions = RequiredInstanceExtensions;
++        const VulkanExternalHooks hooks = GetVulkanExternalHooks();
++
++        std::unordered_set<std::string> requiredExtensions;
++        if (!hooks.headlessSwapChain) {
++            requiredExtensions = RequiredInstanceExtensions;
++        }
+         std::unordered_set<std::string> supportedOptionalExtensions;
+ #   if DLSS_ENABLED
+         const std::unordered_set<std::string> dlssExtensions = DLSS::getRequiredInstanceExtensionsVulkan();
+@@ -4616,7 +4785,7 @@ namespace plume {
+         // Push the extensions specified by SDL as required.
+         // SDL2 has this awkward requirement for the window to pull the extensions from. 
+         // This can be removed when upgrading to SDL3.
+-        if (sdlWindow != nullptr) {
++        if (!hooks.headlessSwapChain && (sdlWindow != nullptr)) {
+             uint32_t sdlVulkanExtensionCount = 0;
+             if (SDL_Vulkan_GetInstanceExtensions(sdlWindow, &sdlVulkanExtensionCount, nullptr)) {
+                 std::vector<char *> sdlVulkanExtensions;
+@@ -4685,7 +4854,8 @@ namespace plume {
+         }
+ #   endif
+         
+-        res = vkCreateInstance(&createInfo, nullptr, &instance);
++        res = hooks.createInstance ? hooks.createInstance(&createInfo, vkGetInstanceProcAddr, &instance)
++                                   : vkCreateInstance(&createInfo, nullptr, &instance);
+         if (res != VK_SUCCESS) {
+             fprintf(stderr, "vkCreateInstance failed with error code 0x%X.\n", res);
+             return;
+diff --git a/plume_vulkan.h b/plume_vulkan.h
+index 49616c7..a22166c 100644
+--- a/plume_vulkan.h
++++ b/plume_vulkan.h
+@@ -53,6 +53,22 @@ namespace plume {
+     void SetVulkanLoaderInitializeCallback(VulkanLoaderInitializeCallback callback);
+     void SetVulkanPhysicalDeviceObserver(VulkanPhysicalDeviceObserver observer);
+ 
++    struct VulkanExternalHooks {
++        bool headlessSwapChain = false;
++        uint32_t headlessWidth = 1440;
++        uint32_t headlessHeight = 1440;
++        uint32_t headlessRefreshRate = 90;
++        VkResult (*createInstance)(const VkInstanceCreateInfo *createInfo, PFN_vkGetInstanceProcAddr getInstanceProcAddr, VkInstance *outInstance) = nullptr;
++        VkResult (*pickPhysicalDevice)(VkInstance instance, VkPhysicalDevice *outPhysicalDevice) = nullptr;
++        VkResult (*createDevice)(VkPhysicalDevice physicalDevice, const VkDeviceCreateInfo *createInfo, PFN_vkGetInstanceProcAddr getInstanceProcAddr, VkDevice *outDevice) = nullptr;
++        void (*onDeviceCreated)(VkInstance instance, VkPhysicalDevice physicalDevice, VkDevice device, uint32_t graphicsQueueFamilyIndex, uint32_t graphicsQueueIndex) = nullptr;
++    };
++
++    void SetVulkanExternalHooks(const VulkanExternalHooks &hooks);
++    VulkanExternalHooks GetVulkanExternalHooks();
++    std::mutex *VulkanGetQueueMutex(RenderDevice *device, uint32_t familyIndex, uint32_t queueIndex);
++    bool VulkanBlitTextureToExternalImage(RenderCommandList *commandList, RenderTexture *srcTexture, uint32_t srcWidth, uint32_t srcHeight, VkImage dstImage, uint32_t dstWidth, uint32_t dstHeight, VkImageLayout dstFinalLayout, bool flipY = false);
++
+     struct VulkanCommandQueue;
+     struct VulkanDevice;
+     struct VulkanInterface;
+@@ -252,6 +268,8 @@ namespace plume {
+         uint64_t currentPresentId = 0;
+         bool immediatePresentModeSupported = false;
+         bool mailboxPresentModeSupported = false;
++        bool headless = false;
++        uint32_t headlessAcquireCursor = 0;
+ 
+         VulkanSwapChain(VulkanCommandQueue *commandQueue, const RenderSwapChainDesc &desc);
+         ~VulkanSwapChain() override;

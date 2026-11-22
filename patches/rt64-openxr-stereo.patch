@@ -1,0 +1,674 @@
+diff --git a/src/contrib/plume b/src/contrib/plume
+--- a/src/contrib/plume
++++ b/src/contrib/plume
+@@ -1 +1 @@
+-Subproject commit 589f88f07dea9da260fb2d20ac505552433dc6d0
++Subproject commit 589f88f07dea9da260fb2d20ac505552433dc6d0-dirty
+diff --git a/src/hle/rt64_present_queue.cpp b/src/hle/rt64_present_queue.cpp
+index 171ed3f..6845580 100644
+--- a/src/hle/rt64_present_queue.cpp
++++ b/src/hle/rt64_present_queue.cpp
+@@ -458,6 +458,49 @@ namespace RT64 {
+         const bool displayTiming = ext.device->getCapabilities().displayTiming;
+         bool swapChainValid = !ext.swapChain->needsResize();
+         while (presentThreadRunning) {
++            VRBridge *vrBridge = GetVRBridge();
++            if ((vrBridge != nullptr) && vrBridge->isActive()) {
++                while (presentThreadRunning) {
++                    int vrProcessCursor = -1;
++                    {
++                        std::unique_lock<std::mutex> cursorLock(cursorMutex);
++                        if (writeCursor != threadCursor) {
++                            vrProcessCursor = threadCursor;
++                            threadCursor = (threadCursor + 1) % presents.size();
++                        }
++                    }
++
++                    if (vrProcessCursor < 0) {
++                        break;
++                    }
++
++                    std::unique_lock<std::mutex> threadLock(threadMutex);
++                    Present &present = presents[vrProcessCursor];
++                    ext.workloadQueue->waitForWorkloadId(present.workloadId);
++                    if (!presentThreadRunning) {
++                        break;
++                    }
++
++                    skipInterpolation();
++                    notifyPresentId(present);
++
++                    if (!present.paused) {
++                        if (!present.fbOperations.empty()) {
++                            const std::scoped_lock lock(screenFbChangePoolMutex);
++                            screenFbChangePool.release(present.fbOperations.front().writeChanges.id);
++                            present.fbOperations.clear();
++                        }
++
++                        threadAdvanceBarrier();
++                    }
++                }
++
++                if (presentThreadRunning) {
++                    vrBridge->onPresentTick(ext.presentGraphicsWorker, ext.sharedResources);
++                }
++                continue;
++            }
++
+             {
+                 std::unique_lock<std::mutex> cursorLock(cursorMutex);
+                 cursorCondition.wait(cursorLock, [&]() {
+@@ -541,8 +584,9 @@ namespace RT64 {
+         }
+ 
+         // Transition the active swap chain render target out of the present state to avoid live references to the resource.
++        VRBridge *exitVrBridge = GetVRBridge();
+         uint32_t swapChainIndex = 0;
+-        if (!ext.swapChain->isEmpty() && ext.swapChain->acquireTexture(acquiredSemaphore.get(), &swapChainIndex)) {
++        if (((exitVrBridge == nullptr) || !exitVrBridge->isActive()) && !ext.swapChain->isEmpty() && ext.swapChain->acquireTexture(acquiredSemaphore.get(), &swapChainIndex)) {
+             RenderTexture *swapChainTexture = ext.swapChain->getTexture(swapChainIndex);
+             ext.presentGraphicsWorker->commandList->begin();
+             ext.presentGraphicsWorker->commandList->barriers(RenderBarrierStage::NONE, RenderTextureBarrier(swapChainTexture, RenderTextureLayout::COLOR_WRITE));
+diff --git a/src/hle/rt64_shared_queue_resources.h b/src/hle/rt64_shared_queue_resources.h
+index 8858dac..f4d6587 100644
+--- a/src/hle/rt64_shared_queue_resources.h
++++ b/src/hle/rt64_shared_queue_resources.h
+@@ -4,6 +4,7 @@
+ 
+ #pragma once
+ 
++#include <atomic>
+ #include <mutex>
+ 
+ #include "common/rt64_common.h"
+@@ -12,6 +13,7 @@
+ #include "render/rt64_render_target_manager.h"
+ 
+ #include "rt64_framebuffer_manager.h"
++#include "rt64_vr_bridge.h"
+ 
+ #if RT_ENABLED
+ #   include "render/rt64_raytracing_resources.h"
+@@ -58,6 +60,25 @@ namespace RT64 {
+         std::condition_variable interpolatedCondition;
+         std::mutex workloadMutex;
+ 
++        // OpenXR stereo + HUD output slots (double-buffered between workload and present threads).
++        struct VRFrameSlot {
++            std::unique_ptr<RenderTarget> eyeTargets[2];
++            std::unique_ptr<RenderTarget> hudTarget;
++            uint32_t eyeWidth[2] = {};
++            uint32_t eyeHeight[2] = {};
++            uint32_t hudWidth = 0;
++            uint32_t hudHeight = 0;
++            bool hasStereo = false;
++            bool hasHud = false;
++            uint64_t frameId = 0;
++            VRViewPoseSnapshot views;
++        };
++
++        VRFrameSlot vrSlots[2];
++        std::mutex vrSlotMutex[2];
++        std::atomic<int> vrPublishedSlot{ -1 };
++        std::atomic<uint64_t> vrFrameCounter{ 0 };
++
+         void setSwapChainSize(uint32_t width, uint32_t height) {
+             std::scoped_lock<std::mutex> configurationLock(configurationMutex);
+             if ((swapChainWidth != width) || (swapChainHeight != height)) {
+diff --git a/src/hle/rt64_vr_bridge.h b/src/hle/rt64_vr_bridge.h
+new file mode 100644
+index 0000000..79b45c5
+--- /dev/null
++++ b/src/hle/rt64_vr_bridge.h
+@@ -0,0 +1,45 @@
++//
++// RT64 OpenXR VR Stereo Bridge
++//
++
++#pragma once
++
++#include <atomic>
++#include <cstdint>
++
++namespace RT64 {
++    struct RenderWorker;
++    struct SharedQueueResources;
++
++    struct VRViewPoseSnapshot {
++        struct Eye {
++            float orientation[4] = { 0.0f, 0.0f, 0.0f, 1.0f };
++            float position[3] = { 0.0f, 0.0f, 0.0f };
++            float fov[4] = { -0.8f, 0.8f, 0.8f, -0.8f };
++        };
++
++        Eye eyes[2];
++        bool valid = false;
++    };
++
++    struct VRBridge {
++        virtual ~VRBridge() = default;
++        virtual bool isActive() const = 0;
++        virtual VRViewPoseSnapshot snapshotFrameViews() = 0;
++        virtual void computeEyeMatrices(int eyeIndex, const VRViewPoseSnapshot &snapshot, const float n64View[16], const float n64Proj[16], float outView[16], float outProj[16]) const = 0;
++        virtual void onPresentTick(RenderWorker *presentWorker, SharedQueueResources *sharedResources) = 0;
++    };
++
++    inline std::atomic<VRBridge *> &vrBridgeSlot() {
++        static std::atomic<VRBridge *> s{ nullptr };
++        return s;
++    }
++
++    inline void SetVRBridge(VRBridge *bridge) {
++        vrBridgeSlot().store(bridge, std::memory_order_release);
++    }
++
++    inline VRBridge *GetVRBridge() {
++        return vrBridgeSlot().load(std::memory_order_acquire);
++    }
++};
+diff --git a/src/hle/rt64_workload_queue.cpp b/src/hle/rt64_workload_queue.cpp
+index f7d2775..f771836 100644
+--- a/src/hle/rt64_workload_queue.cpp
++++ b/src/hle/rt64_workload_queue.cpp
+@@ -117,6 +117,7 @@ namespace RT64 {
+     void WorkloadQueue::updateMultisampling() {
+         renderFramebufferManager->destroyAll();
+         dummyDepthTarget.reset();
++        vrScratchHudTarget.reset();
+         framebufferRenderer->updateMultisampling();
+     }
+ 
+@@ -296,7 +297,10 @@ namespace RT64 {
+     void WorkloadQueue::threadRenderFrame(GameFrame &curFrame, const GameFrame &prevFrame, const WorkloadConfiguration &workloadConfig,
+         const DebuggerRenderer &debuggerRenderer, const DebuggerCamera &debuggerCamera, float curFrameWeight, float prevFrameWeight,
+         float deltaTimeMs, RenderTargetKey overrideTargetKey, int32_t overrideTargetFbPairIndex, RenderTarget *overrideTarget,
+-        uint32_t overrideTargetModifier, bool uploadVelocity, bool uploadExtras, bool interpolateTiles, bool interpolateLookAts)
++        uint32_t overrideTargetModifier, bool uploadVelocity, bool uploadExtras, bool interpolateTiles, bool interpolateLookAts,
++        int vrEyeIndex, const VRViewPoseSnapshot *vrSnapshot, FramebufferRenderer::ProjectionFilter vrProjFilter,
++        RenderTarget *vrCaptureTarget, uint32_t *vrCaptureWidth, uint32_t *vrCaptureHeight,
++        bool vrUseHudScratchTarget, bool vrSkipFbSideEffects)
+     {
+ #   if ENABLE_HIGH_RESOLUTION_RENDERER
+         std::scoped_lock<std::mutex> managerLock(ext.sharedResources->workloadMutex);
+@@ -306,8 +310,10 @@ namespace RT64 {
+ 
+         rendererCPUProfiler.start();
+ 
++        VRBridge *vrBridge = GetVRBridge();
+         const bool aspectRatioAdjustment = (abs(workloadConfig.aspectRatioScale - 1.0f) > 1e-6f);
+-        const bool processProjections = aspectRatioAdjustment || prevFrame.matched|| curFrame.isDebuggerCameraEnabled(*this);
++        const bool vrStereoEye = (vrEyeIndex >= 0) && (vrBridge != nullptr) && (vrSnapshot != nullptr);
++        const bool processProjections = aspectRatioAdjustment || prevFrame.matched || curFrame.isDebuggerCameraEnabled(*this) || vrStereoEye;
+         bool uploadProjections = false;
+         if (processProjections) {
+             ProjectionProcessor::ProcessParams projParams;
+@@ -318,6 +324,9 @@ namespace RT64 {
+             projParams.curFrameWeight = curFrameWeight;
+             projParams.prevFrameWeight = prevFrameWeight;
+             projParams.aspectRatioScale = workloadConfig.aspectRatioScale;
++            projParams.vrEyeIndex = vrEyeIndex;
++            projParams.vrBridge = vrBridge;
++            projParams.vrSnapshot = vrSnapshot;
+             projectionProcessor.process(projParams);
+             projectionProcessor.upload(projParams);
+             uploadProjections = true;
+@@ -454,8 +463,19 @@ namespace RT64 {
+                     }
+ 
+                     if (colorFb != nullptr) {
+-                        fbKey.colorTargetKey = RenderTargetKey(colorFb->addressStart, colorFb->width, colorFb->siz, Framebuffer::Type::Color);
+-                        colorTarget = &targetManager.get(fbKey.colorTargetKey);
++                        if (vrUseHudScratchTarget) {
++                            if (vrScratchHudTarget == nullptr) {
++                                vrScratchHudTarget = std::make_unique<RenderTarget>(0, Framebuffer::Type::Color, targetManager.multisampling, targetManager.usesHDR);
++                            }
++
++                            fbKey.colorTargetKey = RenderTargetKey(0, nativeColorWidth, colorImg.siz, Framebuffer::Type::Color);
++                            fbKey.modifierKey = 0x56524844U;
++                            colorTarget = vrScratchHudTarget.get();
++                        }
++                        else {
++                            fbKey.colorTargetKey = RenderTargetKey(colorFb->addressStart, colorFb->width, colorFb->siz, Framebuffer::Type::Color);
++                            colorTarget = &targetManager.get(fbKey.colorTargetKey);
++                        }
+                     }
+                     else {
+                         colorTarget = nullptr;
+@@ -544,7 +564,9 @@ namespace RT64 {
+ 
+                     if ((colorTarget != nullptr) && colorTarget->resize(ext.workloadGraphicsWorker, rtWidth, rtHeight)) {
+                         resizedTargets.emplace(colorTarget);
+-                        colorFb->readHeight = 0;
++                        if (!vrSkipFbSideEffects) {
++                            colorFb->readHeight = 0;
++                        }
+                     }
+ 
+                     // Set up the dummy target used for rendering the depth if no depth framebuffer is active.
+@@ -569,13 +591,17 @@ namespace RT64 {
+ 
+                         if (depthTarget->resize(ext.workloadGraphicsWorker, rtWidth, rtHeight)) {
+                             resizedTargets.emplace(depthTarget);
+-                            depthFb->readHeight = 0;
++                            if (!vrSkipFbSideEffects) {
++                                depthFb->readHeight = 0;
++                            }
+                         }
+                     }
+                 }
+ 
+-                fbManager.setupOperations(ext.workloadGraphicsWorker, fbPair.startFbOperations, fixedResScale, targetManager, &resizedTargets);
+-                fbManager.setupOperations(ext.workloadGraphicsWorker, fbPair.endFbOperations, fixedResScale, targetManager, &resizedTargets);
++                if (!vrSkipFbSideEffects) {
++                    fbManager.setupOperations(ext.workloadGraphicsWorker, fbPair.startFbOperations, fixedResScale, targetManager, &resizedTargets);
++                    fbManager.setupOperations(ext.workloadGraphicsWorker, fbPair.endFbOperations, fixedResScale, targetManager, &resizedTargets);
++                }
+             }
+ 
+             // Make sure all depth targets are at least bigger than their corresponding color targets.
+@@ -600,9 +626,11 @@ namespace RT64 {
+             // Reset the texture cache vectors for the framebuffer renderer.
+             framebufferRenderer->updateTextureCache(ext.textureCache);
+ 
+-            for (uint32_t f = 0; f < fbPairCount; f++) {
+-                const FramebufferPair &fbPair = workload.fbPairs[f];
+-                fbManager.performDiscards(fbPair.startFbDiscards);
++            if (!vrSkipFbSideEffects) {
++                for (uint32_t f = 0; f < fbPairCount; f++) {
++                    const FramebufferPair &fbPair = workload.fbPairs[f];
++                    fbManager.performDiscards(fbPair.startFbDiscards);
++                }
+             }
+             
+             // Add all framebuffer pairs to the framebuffer renderer and setup the operations.
+@@ -643,6 +671,7 @@ namespace RT64 {
+                     drawParams.postBlendNoise = workloadConfig.postBlendNoise;
+                     drawParams.postBlendNoiseNegative = workloadConfig.postBlendNoiseNegative;
+                     drawParams.maxGameCall = std::min(gameCallCountMax - gameCallCursor, fbPair.gameCallCount);
++                    drawParams.projectionFilter = vrProjFilter;
+                     framebufferRenderer->addFramebuffer(drawParams);
+                 }
+                 
+@@ -710,17 +739,28 @@ namespace RT64 {
+             
+             // Record all framebuffer pairs.
+             uint32_t framebufferIndex = 0;
++            RenderTarget *lastVrColorTarget = nullptr;
++            uint32_t lastVrWidth = 0;
++            uint32_t lastVrHeight = 0;
++            bool vrHudScratchCleared = false;
+             for (uint32_t f = 0; f < fbPairCount; f++) {
+                 const FramebufferPair &fbPair = workload.fbPairs[f];
+                 bool validTargets = getTargetsFromPair(f);
+-                fbManager.recordOperations(ext.workloadGraphicsWorker, &workload.fbChangePool, &workload.fbStorage, ext.shaderLibrary, ext.textureCache,
+-                    fbPair.startFbOperations, targetManager, fixedResScale, f, workload.submissionFrame);
++                if (!vrSkipFbSideEffects) {
++                    fbManager.recordOperations(ext.workloadGraphicsWorker, &workload.fbChangePool, &workload.fbStorage, ext.shaderLibrary, ext.textureCache,
++                        fbPair.startFbOperations, targetManager, fixedResScale, f, workload.submissionFrame);
++                }
+ 
+                 if (validTargets) {
+                     const auto &colorImg = fbPair.colorImage;
+                     const auto &depthImg = fbPair.depthImage;
+                     bool colorFormatUpdated = false;
+-                    if (colorFb != nullptr) {
++                    if (vrUseHudScratchTarget && (colorTarget != nullptr) && !vrHudScratchCleared) {
++                        colorTarget->clearColorTarget(ext.workloadGraphicsWorker);
++                        vrHudScratchCleared = true;
++                    }
++
++                    if (!vrSkipFbSideEffects && (colorFb != nullptr)) {
+                         if (colorImg.formatChanged) {
+                             colorFb->discardLastWrite();
+                         }
+@@ -756,7 +796,7 @@ namespace RT64 {
+                     bool depthFormatUpdated = false;
+                     bool depthFbChanged = false;
+                     bool depthFbTypeChanged = false;
+-                    if (depthFb != nullptr) {
++                    if (!vrSkipFbSideEffects && (depthFb != nullptr)) {
+                         depthFbTypeChanged = (depthFb->lastWriteType == Framebuffer::Type::Color);
+ 
+                         bool imgFormatChanged = (colorFb == nullptr) ? colorImg.formatChanged : depthImg.formatChanged;
+@@ -815,30 +855,76 @@ namespace RT64 {
+                         overrideTarget->resolveFromTarget(ext.workloadGraphicsWorker, colorTarget, ext.shaderLibrary);
+                     }
+ 
+-                    const uint64_t writeTimestamp = fbManager.nextWriteTimestamp();
+-                    FixedRect depthFbRect;
+-                    if (colorFb != nullptr) {
+-                        colorFb->lastWriteRect.merge(fbPair.drawColorRect.scaled(fixedResScale.x, fixedResScale.y));
+-                        colorFb->lastWriteType = Framebuffer::Type::Color;
+-                        colorFb->lastWriteFmt = colorImg.fmt;
+-                        colorFb->lastWriteTimestamp = writeTimestamp;
+-                        depthFbRect = fbPair.drawDepthRect;
+-                    }
+-                    else {
+-                        depthFbRect = fbPair.drawColorRect;
++                    if (colorTarget != nullptr) {
++                        lastVrColorTarget = colorTarget;
++                        lastVrWidth = std::min(targetWidth, colorTarget->width);
++                        lastVrHeight = std::min(targetHeight, colorTarget->height);
+                     }
+-                    
+-                    const bool depthWrite = ((colorFb == nullptr) || depthFbChanged || depthFbTypeChanged || fbPair.depthWrite) && (depthFb != nullptr);
+-                    if (depthWrite && !depthFbRect.isNull()) {
+-                        depthFb->lastWriteRect.merge(depthFbRect.scaled(fixedResScale.x, fixedResScale.y));
+-                        depthFb->lastWriteType = Framebuffer::Type::Depth;
+-                        depthFb->lastWriteFmt = G_IM_FMT_DEPTH;
+-                        depthFb->lastWriteTimestamp = writeTimestamp;
++
++                    if (!vrSkipFbSideEffects) {
++                        const uint64_t writeTimestamp = fbManager.nextWriteTimestamp();
++                        FixedRect depthFbRect;
++                        if (colorFb != nullptr) {
++                            colorFb->lastWriteRect.merge(fbPair.drawColorRect.scaled(fixedResScale.x, fixedResScale.y));
++                            colorFb->lastWriteType = Framebuffer::Type::Color;
++                            colorFb->lastWriteFmt = colorImg.fmt;
++                            colorFb->lastWriteTimestamp = writeTimestamp;
++                            depthFbRect = fbPair.drawDepthRect;
++                        }
++                        else {
++                            depthFbRect = fbPair.drawColorRect;
++                        }
++                        
++                        const bool depthWrite = ((colorFb == nullptr) || depthFbChanged || depthFbTypeChanged || fbPair.depthWrite) && (depthFb != nullptr);
++                        if (depthWrite && !depthFbRect.isNull()) {
++                            depthFb->lastWriteRect.merge(depthFbRect.scaled(fixedResScale.x, fixedResScale.y));
++                            depthFb->lastWriteType = Framebuffer::Type::Depth;
++                            depthFb->lastWriteFmt = G_IM_FMT_DEPTH;
++                            depthFb->lastWriteTimestamp = writeTimestamp;
++                        }
+                     }
+                 }
+                 
+-                fbManager.recordOperations(ext.workloadGraphicsWorker, &workload.fbChangePool, &workload.fbStorage, ext.shaderLibrary, ext.textureCache,
+-                    fbPair.endFbOperations, targetManager, fixedResScale, f, workload.submissionFrame);
++                if (!vrSkipFbSideEffects) {
++                    fbManager.recordOperations(ext.workloadGraphicsWorker, &workload.fbChangePool, &workload.fbStorage, ext.shaderLibrary, ext.textureCache,
++                        fbPair.endFbOperations, targetManager, fixedResScale, f, workload.submissionFrame);
++                }
++            }
++
++            if ((vrCaptureTarget != nullptr) && (lastVrColorTarget != nullptr) && (lastVrWidth > 0) && (lastVrHeight > 0)) {
++                vrCaptureTarget->resize(ext.workloadGraphicsWorker, lastVrWidth, lastVrHeight);
++                if (usingMSAA) {
++                    vrCaptureTarget->resolveFromTarget(ext.workloadGraphicsWorker, lastVrColorTarget, ext.shaderLibrary);
++                    RenderTextureBarrier postResolveBarriers[] = {
++                        RenderTextureBarrier(lastVrColorTarget->texture.get(), RenderTextureLayout::SHADER_READ),
++                        RenderTextureBarrier(vrCaptureTarget->texture.get(), RenderTextureLayout::SHADER_READ)
++                    };
++                    ext.workloadGraphicsWorker->commandList->barriers(RenderBarrierStage::GRAPHICS, postResolveBarriers, uint32_t(std::size(postResolveBarriers)));
++                }
++                else {
++                    RenderTextureBarrier preCopyBarriers[] = {
++                        RenderTextureBarrier(lastVrColorTarget->texture.get(), RenderTextureLayout::COPY_SOURCE),
++                        RenderTextureBarrier(vrCaptureTarget->texture.get(), RenderTextureLayout::COPY_DEST)
++                    };
++                    ext.workloadGraphicsWorker->commandList->barriers(RenderBarrierStage::COPY, preCopyBarriers, uint32_t(std::size(preCopyBarriers)));
++                    RenderBox srcBox(0, 0, int32_t(lastVrWidth), int32_t(lastVrHeight), 0, 1);
++                    ext.workloadGraphicsWorker->commandList->copyTextureRegion(
++                        RenderTextureCopyLocation::Subresource(vrCaptureTarget->texture.get()),
++                        RenderTextureCopyLocation::Subresource(lastVrColorTarget->texture.get()),
++                        0, 0, 0, &srcBox);
++                    RenderTextureBarrier postCopyBarriers[] = {
++                        RenderTextureBarrier(lastVrColorTarget->texture.get(), RenderTextureLayout::SHADER_READ),
++                        RenderTextureBarrier(vrCaptureTarget->texture.get(), RenderTextureLayout::SHADER_READ)
++                    };
++                    ext.workloadGraphicsWorker->commandList->barriers(RenderBarrierStage::GRAPHICS, postCopyBarriers, uint32_t(std::size(postCopyBarriers)));
++                }
++
++                if (vrCaptureWidth != nullptr) {
++                    *vrCaptureWidth = lastVrWidth;
++                }
++                if (vrCaptureHeight != nullptr) {
++                    *vrCaptureHeight = lastVrHeight;
++                }
+             }
+ 
+             ext.workloadGraphicsWorker->commandList->writeTimestamp(queryPool.get(), 1);
+@@ -989,8 +1075,12 @@ namespace RT64 {
+                     matchingProfiler.end();
+                     matchingProfiler.log();
+ 
++                    const bool vrActiveNow = []() {
++                        VRBridge *b = GetVRBridge();
++                        return (b != nullptr) && b->isActive();
++                    }();
+                     const bool displayRateAboveOriginal = (workload.viOriginalRate > 0) && (workloadConfig.targetRate > workload.viOriginalRate);
+-                    generateInterpolatedFrames = !workload.paused && displayRateAboveOriginal && !interpolationTargetKey.isEmpty();
++                    generateInterpolatedFrames = !vrActiveNow && !workload.paused && displayRateAboveOriginal && !interpolationTargetKey.isEmpty();
+ 
+                     const bool resetTicks = !generateInterpolatedFrames || (originalRateForTicks != workload.viOriginalRate) || (displayRateForTicks != workloadConfig.targetRate) || !displayRateAboveOriginal;
+                     if (resetTicks) {
+@@ -1121,8 +1211,78 @@ namespace RT64 {
+                     }
+ 
+                     int64_t renderTimeMicro = workloadTimer.elapsedMicroseconds();
+-                    threadRenderFrame(curFrame, prevFrame, workloadConfig, workload.debuggerRenderer, workload.debuggerCamera, curFrameWeight, prevFrameWeight, deltaTimeMs,
+-                        interpolationTargetKey, interpolationTargetFbPairIndex, overrideTarget, overrideModifier, velocityUploaderUsed, uploadExtras, tileInterpolationUsed, lookAtInterpolationUsed);
++                    VRBridge *vrBridge = GetVRBridge();
++                    const bool vrActive = (vrBridge != nullptr) && vrBridge->isActive();
++                    if (vrActive) {
++                        bool hasPerspective = false;
++                        const uint32_t pairLimit = (workload.debuggerRenderer.framebufferIndex >= 0) ? (workload.debuggerRenderer.framebufferIndex + 1) : workload.fbPairCount;
++                        for (uint32_t f = 0; (f < pairLimit) && !hasPerspective; f++) {
++                            const FramebufferPair &fbPair = workload.fbPairs[f];
++                            for (uint32_t p = 0; p < fbPair.projectionCount; p++) {
++                                const Projection &proj = fbPair.projections[p];
++                                if ((proj.type == Projection::Type::Perspective) && !proj.scissorRect.isNull() && (proj.gameCallCount > 0)) {
++                                    hasPerspective = true;
++                                    break;
++                                }
++                            }
++                        }
++
++                        const int writeSlot = (ext.sharedResources->vrPublishedSlot.load(std::memory_order_acquire) == 0) ? 1 : 0;
++                        {
++                            std::scoped_lock<std::mutex> vrLock(ext.sharedResources->vrSlotMutex[writeSlot]);
++                            SharedQueueResources::VRFrameSlot &slot = ext.sharedResources->vrSlots[writeSlot];
++                            const bool usesHDR = ext.sharedResources->renderTargetManager.usesHDR;
++                            for (int eye = 0; eye < 2; eye++) {
++                                if (slot.eyeTargets[eye] == nullptr) {
++                                    slot.eyeTargets[eye] = std::make_unique<RenderTarget>(0, Framebuffer::Type::Color, RenderMultisampling(), usesHDR);
++                                }
++                                slot.eyeWidth[eye] = 0;
++                                slot.eyeHeight[eye] = 0;
++                            }
++                            if (slot.hudTarget == nullptr) {
++                                slot.hudTarget = std::make_unique<RenderTarget>(0, Framebuffer::Type::Color, RenderMultisampling(), usesHDR);
++                            }
++                            slot.hudWidth = 0;
++                            slot.hudHeight = 0;
++
++                            if (hasPerspective) {
++                                slot.views = vrBridge->snapshotFrameViews();
++                                for (int eye = 0; eye < 2; eye++) {
++                                    threadRenderFrame(curFrame, prevFrame, workloadConfig, workload.debuggerRenderer, workload.debuggerCamera, curFrameWeight, prevFrameWeight, deltaTimeMs,
++                                        interpolationTargetKey, interpolationTargetFbPairIndex, overrideTarget, overrideModifier, velocityUploaderUsed, uploadExtras, tileInterpolationUsed, lookAtInterpolationUsed,
++                                        eye, &slot.views, FramebufferRenderer::ProjectionFilter::PerspectiveOnly,
++                                        slot.eyeTargets[eye].get(), &slot.eyeWidth[eye], &slot.eyeHeight[eye],
++                                        false, eye != 0);
++                                }
++
++                                threadRenderFrame(curFrame, prevFrame, workloadConfig, workload.debuggerRenderer, workload.debuggerCamera, curFrameWeight, prevFrameWeight, deltaTimeMs,
++                                    interpolationTargetKey, interpolationTargetFbPairIndex, overrideTarget, overrideModifier, velocityUploaderUsed, false, tileInterpolationUsed, lookAtInterpolationUsed,
++                                    -1, nullptr, FramebufferRenderer::ProjectionFilter::HudOnly,
++                                    slot.hudTarget.get(), &slot.hudWidth, &slot.hudHeight,
++                                    true, true);
++
++                                slot.hasStereo = (slot.eyeWidth[0] > 0) && (slot.eyeWidth[1] > 0);
++                                slot.hasHud = (slot.hudWidth > 0);
++                            }
++                            else {
++                                threadRenderFrame(curFrame, prevFrame, workloadConfig, workload.debuggerRenderer, workload.debuggerCamera, curFrameWeight, prevFrameWeight, deltaTimeMs,
++                                    interpolationTargetKey, interpolationTargetFbPairIndex, overrideTarget, overrideModifier, velocityUploaderUsed, uploadExtras, tileInterpolationUsed, lookAtInterpolationUsed,
++                                    -1, nullptr, FramebufferRenderer::ProjectionFilter::All,
++                                    slot.hudTarget.get(), &slot.hudWidth, &slot.hudHeight,
++                                    false, false);
++
++                                slot.hasStereo = false;
++                                slot.hasHud = (slot.hudWidth > 0);
++                            }
++
++                            slot.frameId = ++ext.sharedResources->vrFrameCounter;
++                        }
++                        ext.sharedResources->vrPublishedSlot.store(writeSlot, std::memory_order_release);
++                    }
++                    else {
++                        threadRenderFrame(curFrame, prevFrame, workloadConfig, workload.debuggerRenderer, workload.debuggerCamera, curFrameWeight, prevFrameWeight, deltaTimeMs,
++                            interpolationTargetKey, interpolationTargetFbPairIndex, overrideTarget, overrideModifier, velocityUploaderUsed, uploadExtras, tileInterpolationUsed, lookAtInterpolationUsed);
++                    }
+ 
+                     // Add total time the frame took to render.
+                     renderTimeTotalMicro += workloadTimer.elapsedMicroseconds() - renderTimeMicro;
+diff --git a/src/hle/rt64_workload_queue.h b/src/hle/rt64_workload_queue.h
+index d98c648..ab7606c 100644
+--- a/src/hle/rt64_workload_queue.h
++++ b/src/hle/rt64_workload_queue.h
+@@ -91,6 +91,7 @@ namespace RT64 {
+         std::unique_ptr<RSPProcessor> rspProcessor;
+         std::unique_ptr<VertexProcessor> vertexProcessor;
+         std::unique_ptr<RenderTarget> dummyDepthTarget;
++        std::unique_ptr<RenderTarget> vrScratchHudTarget;
+         std::unique_ptr<RenderQueryPool> queryPool;
+         FramebufferChangePool scratchFbChangePool;
+         ProfilingTimer rendererCPUProfiler = ProfilingTimer(120);
+@@ -116,7 +117,11 @@ namespace RT64 {
+         void threadRenderFrame(GameFrame &curFrame, const GameFrame &prevFrame, const WorkloadConfiguration &workloadConfig,
+             const DebuggerRenderer &debuggerRenderer, const DebuggerCamera &debuggerCamera, float curFrameWeight, float prevFrameWeight,
+             float deltaTimeMs, RenderTargetKey overrideTargetKey, int32_t overrideTargetFbPairIndex, RenderTarget *overrideTarget,
+-            uint32_t overrideTargetModifier, bool uploadVelocity, bool uploadExtras, bool interpolateTiles, bool interpolateLookAts);
++            uint32_t overrideTargetModifier, bool uploadVelocity, bool uploadExtras, bool interpolateTiles, bool interpolateLookAts,
++            int vrEyeIndex = -1, const VRViewPoseSnapshot *vrSnapshot = nullptr,
++            FramebufferRenderer::ProjectionFilter vrProjFilter = FramebufferRenderer::ProjectionFilter::All,
++            RenderTarget *vrCaptureTarget = nullptr, uint32_t *vrCaptureWidth = nullptr, uint32_t *vrCaptureHeight = nullptr,
++            bool vrUseHudScratchTarget = false, bool vrSkipFbSideEffects = false);
+ 
+         void threadAdvanceBarrier();
+         void threadAdvanceWorkloadId(uint64_t newWorkloadId);
+diff --git a/src/render/rt64_framebuffer_renderer.cpp b/src/render/rt64_framebuffer_renderer.cpp
+index 3d26e06..d28c53f 100644
+--- a/src/render/rt64_framebuffer_renderer.cpp
++++ b/src/render/rt64_framebuffer_renderer.cpp
+@@ -1518,6 +1518,25 @@ namespace RT64 {
+ 
+             for (uint32_t d = 0; (d < proj.gameCallCount) && (globalCallIndex < p.maxGameCall); d++) {
+                 const GameCall &call = proj.gameCalls[d];
++                const uint32_t cycleType = call.callDesc.otherMode.cycleType();
++                if (p.projectionFilter != ProjectionFilter::All) {
++                    const bool isPerspProj = (proj.type == Projection::Type::Perspective);
++                    const bool isDepthOnlyTarget = (p.fbStorage->colorTarget == nullptr);
++                    const bool isFillClear = (cycleType == G_CYC_FILL);
++                    if (p.projectionFilter == ProjectionFilter::PerspectiveOnly) {
++                        if (!isPerspProj && !isFillClear && !isDepthOnlyTarget) {
++                            globalCallIndex++;
++                            continue;
++                        }
++                    }
++                    else if (p.projectionFilter == ProjectionFilter::HudOnly) {
++                        if (isDepthOnlyTarget || isPerspProj || isFillClear) {
++                            globalCallIndex++;
++                            continue;
++                        }
++                    }
++                }
++
+                 renderIndices.instanceIndex = call.callDesc.callIndex;
+                 renderIndices.faceIndicesStart = call.meshDesc.faceIndicesStart;
+                 renderIndices.rdpTileIndex = call.callDesc.tileIndex;
+@@ -1525,7 +1544,6 @@ namespace RT64 {
+                 renderIndices.highlightColor = call.debuggerDesc.highlightColor;
+                 renderIndicesVector.push_back(renderIndices);
+ 
+-                uint32_t cycleType = call.callDesc.otherMode.cycleType();
+                 if (cycleType == G_CYC_FILL) {
+                     instanceDrawCall.type = InstanceDrawCall::Type::FillRect;
+ 
+diff --git a/src/render/rt64_framebuffer_renderer.h b/src/render/rt64_framebuffer_renderer.h
+index 3add9c3..5cc6fd7 100644
+--- a/src/render/rt64_framebuffer_renderer.h
++++ b/src/render/rt64_framebuffer_renderer.h
+@@ -124,6 +124,12 @@ namespace RT64 {
+         std::vector<BufferUploader *> pendingUploaders;
+         uint32_t framebufferCount = 0;
+ 
++        enum class ProjectionFilter {
++            All,
++            PerspectiveOnly,
++            HudOnly
++        };
++
+         struct DrawParams {
+             RenderWorker *worker;
+             RenderFramebufferStorage *fbStorage;
+@@ -147,6 +153,7 @@ namespace RT64 {
+             bool postBlendNoise;
+             bool postBlendNoiseNegative;
+             uint32_t maxGameCall;
++            ProjectionFilter projectionFilter = ProjectionFilter::All;
+         };
+ 
+         FramebufferRenderer(RenderWorker *worker, bool rtSupport, UserConfiguration::GraphicsAPI graphicsAPI, const ShaderLibrary *shaderLibrary);
+diff --git a/src/render/rt64_projection_processor.cpp b/src/render/rt64_projection_processor.cpp
+index e842dcc..49de528 100644
+--- a/src/render/rt64_projection_processor.cpp
++++ b/src/render/rt64_projection_processor.cpp
+@@ -112,11 +112,33 @@ namespace RT64 {
+                 projMatrix = workload.debuggerCamera.projMatrix;
+             }
+ 
+-            adjustProjectionMatrix(projMatrix, projRatioScale);
++            const bool vrOverride = (p.vrBridge != nullptr) && (p.vrEyeIndex >= 0) && (p.vrSnapshot != nullptr) && p.vrSnapshot->valid && (proj.type == Projection::Type::Perspective);
++            if (vrOverride) {
++                float inView[16];
++                float inProj[16];
++                float outView[16];
++                float outProj[16];
++                for (int r = 0; r < 4; ++r) {
++                    for (int c = 0; c < 4; ++c) {
++                        inView[r * 4 + c] = viewMatrix[r][c];
++                        inProj[r * 4 + c] = projMatrix[r][c];
++                    }
++                }
++                p.vrBridge->computeEyeMatrices(p.vrEyeIndex, *p.vrSnapshot, inView, inProj, outView, outProj);
++                for (int r = 0; r < 4; ++r) {
++                    for (int c = 0; c < 4; ++c) {
++                        viewMatrix[r][c] = outView[r * 4 + c];
++                        projMatrix[r][c] = outProj[r * 4 + c];
++                    }
++                }
++            }
++            else {
++                adjustProjectionMatrix(projMatrix, projRatioScale);
++            }
+ 
+             interop::float4x4 &prevViewTransform = drawData.prevViewTransforms[proj.transformsIndex];
+             interop::float4x4 &prevProjTransform = drawData.prevProjTransforms[proj.transformsIndex];
+-            if ((prevProjMatrix != nullptr) && (prevViewMatrix != nullptr) && (rigidBody != nullptr)) {
++            if (!vrOverride && (prevProjMatrix != nullptr) && (prevViewMatrix != nullptr) && (rigidBody != nullptr)) {
+                 const interop::float4x4 curViewTransform = viewMatrix;
+                 const interop::float4x4 curProjTransform = projMatrix;
+                 interop::float4x4 adjustedPrevProj = *prevProjMatrix;
+diff --git a/src/render/rt64_projection_processor.h b/src/render/rt64_projection_processor.h
+index 5bc3a2a..ec01db9 100644
+--- a/src/render/rt64_projection_processor.h
++++ b/src/render/rt64_projection_processor.h
+@@ -5,6 +5,7 @@
+ #pragma once
+ 
+ #include "hle/rt64_game_frame.h"
++#include "hle/rt64_vr_bridge.h"
+ 
+ #include "rt64_buffer_uploader.h"
+ 
+@@ -21,6 +22,9 @@ namespace RT64 {
+             float curFrameWeight = 1.0f;
+             float prevFrameWeight = 0.0f;
+             float aspectRatioScale = 1.0f;
++            int vrEyeIndex = -1;
++            const VRBridge *vrBridge = nullptr;
++            const VRViewPoseSnapshot *vrSnapshot = nullptr;
+         };
+ 
+         ProjectionProcessor();

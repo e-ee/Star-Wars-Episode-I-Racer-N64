@@ -24,6 +24,7 @@
 #endif
 
 #include <SDL.h>
+#include "vr/vr_openxr.hpp"
 #if defined(_WIN32)
 #include <SDL_syswm.h>
 #elif defined(__ANDROID__)
@@ -509,6 +510,19 @@ bool get_input(int controller_num, uint16_t* buttons, float* x, float* y) {
         *y = ty;
     }
 
+    // OpenXR Touch Plus controllers (Quest 3)
+    if (SWE1RVR::isActive()) {
+        uint16_t vrButtons = 0;
+        float vrX = 0.0f;
+        float vrY = 0.0f;
+        SWE1RVR::getInputState(vrButtons, vrX, vrY);
+        *buttons |= vrButtons;
+        if (vrX * vrX + vrY * vrY > 0.0025f) {
+            *x = vrX;
+            *y = vrY;
+        }
+    }
+
     *x = std::clamp(*x, -1.0f, 1.0f);
     *y = std::clamp(*y, -1.0f, 1.0f);
 
@@ -523,13 +537,16 @@ bool get_input(int controller_num, uint16_t* buttons, float* x, float* y) {
 }
 
 void set_rumble(int controller_num, bool rumble) {
-    // TODO: SDL haptic feedback
+    if (controller_num == 0 && SWE1RVR::isActive()) {
+        SWE1RVR::setRumble(rumble);
+    }
 }
 
 ultramodern::input::connected_device_info_t get_connected_device_info(int controller_num) {
-    // Player 1 is always present: the on-screen touch pad counts as a controller.
+    // Player 1 is always present: Touch Plus / Rumble Pak on Quest 3 VR.
     if (controller_num == 0) {
-        return { ultramodern::input::Device::Controller, ultramodern::input::Pak::None };
+        const auto pak = SWE1RVR::isActive() ? ultramodern::input::Pak::RumblePak : ultramodern::input::Pak::None;
+        return { ultramodern::input::Device::Controller, pak };
     }
     return { ultramodern::input::Device::None, ultramodern::input::Pak::None };
 }
